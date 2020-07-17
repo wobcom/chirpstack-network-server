@@ -92,6 +92,13 @@ type API struct {
 	netID lorawan.NetID
 }
 
+// NewAPI creates a new API.
+func NewAPI(netID lorawan.NetID) *API {
+	return &API{
+		netID: netID,
+	}
+}
+
 // ServeHTTP handles a HTTP request.
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// read request body
@@ -189,6 +196,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (a *API) handleAsync(ctx context.Context, client backend.Client, basePL backend.BasePayload, b []byte) {
 	ans, err := a.handleRequest(ctx, client, basePL, b)
 	if err != nil {
+
 		ans = a.getBasePayloadResult(basePL, a.errToResultCode(err), err.Error())
 	}
 

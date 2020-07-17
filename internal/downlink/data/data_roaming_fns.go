@@ -27,7 +27,7 @@ func HandleRoamingFNS(ctx context.Context, pl backend.XmitDataReqPayload) error 
 	}
 
 	if len(rxInfo) == 0 {
-		return errors.Wrap(err, "GWInfo must not be empty")
+		return errors.New("GWInfo must not be empty")
 	}
 
 	sort.Sort(bySignal(rxInfo))

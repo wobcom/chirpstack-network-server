@@ -11,6 +11,7 @@ import (
 
 	"github.com/brocaar/chirpstack-api/go/v3/common"
 	"github.com/brocaar/chirpstack-api/go/v3/gw"
+	roamingapi "github.com/brocaar/chirpstack-network-server/internal/api/roaming"
 	"github.com/brocaar/chirpstack-network-server/internal/backend/joinserver"
 	"github.com/brocaar/chirpstack-network-server/internal/band"
 	"github.com/brocaar/chirpstack-network-server/internal/config"
@@ -543,7 +544,121 @@ func (ts *PassiveRoamingFNSTestSuite) TestDataStatefull() {
 }
 
 func (ts *PassiveRoamingFNSTestSuite) TestDownlink() {
+	assert := require.New(ts.T())
+	config := test.GetConfig()
+	api := roamingapi.NewAPI(config.NetworkServer.NetID)
 
+	server := httptest.NewServer(api)
+	defer server.Close()
+
+	client, err := backend.NewClient(backend.ClientConfig{
+		SenderID:   "060606",
+		ReceiverID: config.NetworkServer.NetID.String(),
+		Server:     server.URL,
+	})
+	assert.NoError(err)
+
+	dlFreq1 := 868.1
+	dlFreq2 := 868.2
+	rxDelay1 := 1
+	dataRate1 := 3
+	dataRate2 := 2
+	classMode := "A"
+
+	ulRxInfo := gw.UplinkRXInfo{
+		GatewayId: ts.Gateway.GatewayID[:],
+		Rssi:      -10,
+		LoraSnr:   3,
+		Board:     1,
+		Antenna:   0,
+		Context:   []byte{1, 2, 3},
+	}
+	ulRxInfoB, err := proto.Marshal(&ulRxInfo)
+	assert.NoError(err)
+
+	req := backend.XmitDataReqPayload{
+		PHYPayload: backend.HEXBytes{1, 2, 3},
+		DLMetaData: &backend.DLMetaData{
+			DLFreq1:   &dlFreq1,
+			DLFreq2:   &dlFreq2,
+			RXDelay1:  &rxDelay1,
+			DataRate1: &dataRate1,
+			DataRate2: &dataRate2,
+			ClassMode: &classMode,
+			GWInfo: []backend.GWInfoElement{
+				{
+					ULToken: backend.HEXBytes(ulRxInfoB),
+				},
+			},
+		},
+	}
+
+	// perform API request
+	resp, err := client.XmitDataReq(context.Background(), req)
+	assert.NoError(err)
+
+	// check that api returns success
+	assert.Equal(backend.Success, resp.Result.ResultCode)
+
+	// check that downlink was sent to the gateway
+	frame := <-ts.GWBackend.TXPacketChan
+	assert.Len(frame.DownlinkId, 16) // just check that the downlink id is set, we can't predict its value
+	frame.DownlinkId = nil
+	assert.Equal(gw.DownlinkFrame{
+		GatewayId: ts.Gateway.GatewayID[:],
+		Items: []*gw.DownlinkFrameItem{
+			{
+				PhyPayload: []byte{1, 2, 3},
+				TxInfo: &gw.DownlinkTXInfo{
+					Frequency:  868100000,
+					Power:      14,
+					Modulation: common.Modulation_LORA,
+					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
+						LoraModulationInfo: &gw.LoRaModulationInfo{
+							Bandwidth:             125,
+							SpreadingFactor:       9,
+							CodeRate:              "4/5",
+							PolarizationInversion: true,
+						},
+					},
+					Board:   1,
+					Antenna: 0,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
+						},
+					},
+					Context: []byte{1, 2, 3},
+				},
+			},
+			{
+				PhyPayload: []byte{1, 2, 3},
+				TxInfo: &gw.DownlinkTXInfo{
+					Frequency:  868200000,
+					Power:      14,
+					Modulation: common.Modulation_LORA,
+					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
+						LoraModulationInfo: &gw.LoRaModulationInfo{
+							Bandwidth:             125,
+							SpreadingFactor:       10,
+							CodeRate:              "4/5",
+							PolarizationInversion: true,
+						},
+					},
+					Board:   1,
+					Antenna: 0,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second * 2),
+						},
+					},
+					Context: []byte{1, 2, 3},
+				},
+			},
+		},
+	}, frame)
 }
 
 type PassiveRoamingSNSTestSuite struct {
