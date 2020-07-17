@@ -38,6 +38,7 @@ var (
 func Setup(c config.Config) error {
 	netID = c.NetworkServer.NetID
 	keks = make(map[string][]byte)
+	agreements = []agreement{}
 
 	for _, server := range c.Roaming.Servers {
 		roamingEnabled = true

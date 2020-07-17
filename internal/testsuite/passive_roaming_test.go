@@ -9,6 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/uuid"
+	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/brocaar/chirpstack-api/go/v3/as"
 	"github.com/brocaar/chirpstack-api/go/v3/common"
 	"github.com/brocaar/chirpstack-api/go/v3/gw"
 	roamingapi "github.com/brocaar/chirpstack-network-server/internal/api/roaming"
@@ -22,13 +29,12 @@ import (
 	"github.com/brocaar/chirpstack-network-server/internal/uplink"
 	"github.com/brocaar/lorawan"
 	"github.com/brocaar/lorawan/backend"
-	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/stretchr/testify/require"
-	"github.com/stretchr/testify/suite"
 )
 
+// PassiveRoamingFNSTestSuite contains the tests from the fNS POV.
+// This tests the receiving of uplinks by gateways and forwarding these to the
+// hNS of these devices. It also tests downlinks received by the hNS and
+// forwarding these to the gateway.
 type PassiveRoamingFNSTestSuite struct {
 	IntegrationTestSuite
 
@@ -661,24 +667,588 @@ func (ts *PassiveRoamingFNSTestSuite) TestDownlink() {
 	}, frame)
 }
 
+// PassiveRoamingSNSTestSuite contains the tests from the hNS POV.
+// This tests uplinks received from a fNS (through the roaming API) and
+// forwarding these uplinks to the application-server. It also tests sending
+// downloads back to the fNS (roaming API).
 type PassiveRoamingSNSTestSuite struct {
 	IntegrationTestSuite
+
+	// mocked request / response for the fNS
+	fnsServer   *httptest.Server
+	fnsRequest  [][]byte
+	fnsResponse [][]byte
+
+	// hNS roaming API endpoint
+	hnsServer *httptest.Server
 }
 
-func (ts *PassiveRoamingSNSTestSuite) TestPRStartAnsStateless() {
+func (ts *PassiveRoamingSNSTestSuite) SetupTest() {
+	ts.IntegrationTestSuite.SetupTest()
 
+	ts.fnsRequest = nil
+	ts.fnsResponse = nil
 }
 
-func (ts *PassiveRoamingSNSTestSuite) TestPRStartAnsStatefull() {
+func (ts *PassiveRoamingSNSTestSuite) SetupSuite() {
+	ts.IntegrationTestSuite.SetupSuite()
+	assert := require.New(ts.T())
 
+	// fNS mock
+	ts.fnsServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := ioutil.ReadAll(r.Body)
+		ts.fnsRequest = append(ts.fnsRequest, b)
+		w.Write(ts.fnsResponse[0])
+		ts.fnsResponse = ts.fnsResponse[1:]
+	}))
+
+	// configuration
+	conf := test.GetConfig()
+
+	// configure hNS API
+	api := roamingapi.NewAPI(conf.NetworkServer.NetID)
+	ts.hnsServer = httptest.NewServer(api)
+
+	// configure passive-roaming agreement with fNS
+	conf.Roaming.Servers = []config.RoamingServer{
+		{
+			NetID:                  lorawan.NetID{6, 6, 6},
+			CheckMIC:               true,
+			Async:                  false,
+			PassiveRoaming:         true,
+			PassiveRoamingLifetime: time.Minute,
+			Server:                 ts.fnsServer.URL,
+		},
+	}
+	assert.NoError(roaming.Setup(conf))
+
+	// create test device
+	ts.CreateServiceProfile(storage.ServiceProfile{
+		DRMax:         5,
+		AddGWMetadata: true,
+	})
+	ts.CreateDevice(storage.Device{
+		DevEUI: lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
+	})
+}
+
+func (ts *PassiveRoamingSNSTestSuite) TearDownSuite() {
+	ts.fnsServer.Close()
+	ts.hnsServer.Close()
+}
+
+func (ts *PassiveRoamingSNSTestSuite) TestPRStartReqStateless() {
+	assert := require.New(ts.T())
+
+	// setup stateless roaming-agreement
+	conf := test.GetConfig()
+	conf.Roaming.Servers = []config.RoamingServer{
+		{
+			NetID:                  lorawan.NetID{6, 6, 6},
+			CheckMIC:               true,
+			Async:                  false,
+			PassiveRoaming:         true,
+			PassiveRoamingLifetime: 0,
+			Server:                 ts.fnsServer.URL,
+		},
+	}
+	assert.NoError(roaming.Setup(conf))
+
+	devAddr := lorawan.DevAddr{1, 2, 3, 4}
+	devAddr.SetAddrPrefix(conf.NetworkServer.NetID)
+
+	// setup device-session
+	ts.CreateDeviceSession(storage.DeviceSession{
+		JoinEUI:               lorawan.EUI64{8, 7, 6, 5, 4, 3, 2, 1},
+		DevAddr:               devAddr,
+		FNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		NwkSEncKey:            [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		FCntUp:                20,
+		NFCntDown:             10,
+		EnabledUplinkChannels: []int{0, 1, 2},
+		RX2Frequency:          869525000,
+	})
+
+	fPort := uint8(10)
+
+	phy := lorawan.PHYPayload{
+		MHDR: lorawan.MHDR{
+			MType: lorawan.UnconfirmedDataUp,
+			Major: lorawan.LoRaWANR1,
+		},
+		MACPayload: &lorawan.MACPayload{
+			FHDR: lorawan.FHDR{
+				DevAddr: devAddr,
+				FCnt:    20,
+			},
+			FPort: &fPort,
+		},
+	}
+	assert.NoError(phy.SetUplinkDataMIC(lorawan.LoRaWAN1_0, 0, 0, 0, ts.DeviceSession.FNwkSIntKey, ts.DeviceSession.SNwkSIntKey))
+	phyB, err := phy.MarshalBinary()
+	assert.NoError(err)
+
+	// setup client
+	client, err := backend.NewClient(backend.ClientConfig{
+		SenderID:   "060606",
+		ReceiverID: conf.NetworkServer.NetID.String(),
+		Server:     ts.hnsServer.URL,
+	})
+	assert.NoError(err)
+
+	// request
+	ulFreq := 868.1
+	dataRate := 3
+	recvTime := time.Now().Round(time.Second)
+	gwCnt := 1
+
+	prStartReq := backend.PRStartReqPayload{
+		PHYPayload: backend.HEXBytes(phyB),
+		ULMetaData: backend.ULMetaData{
+			ULFreq:   &ulFreq,
+			DataRate: &dataRate,
+			RecvTime: backend.ISO8601Time(recvTime),
+			RFRegion: "EU868",
+			GWCnt:    &gwCnt,
+			GWInfo: []backend.GWInfoElement{
+				{
+					ID:        backend.HEXBytes{1, 2, 3, 4, 5, 6, 7, 8},
+					DLAllowed: true,
+				},
+			},
+		},
+	}
+	resp, err := client.PRStartReq(context.Background(), prStartReq)
+	assert.NoError(err)
+	assert.Equal(backend.Success, resp.Result.ResultCode)
+	assert.Equal(0, *resp.Lifetime)
+
+	// check downlink was sent to AS
+	asReq := <-ts.ASClient.HandleDataUpChan
+	assert.True(proto.Equal(&as.HandleUplinkDataRequest{
+		DevEui:  ts.Device.DevEUI[:],
+		JoinEui: ts.DeviceSession.JoinEUI[:],
+		FCnt:    20,
+		FPort:   10,
+		Dr:      3,
+		TxInfo: &gw.UplinkTXInfo{
+			Frequency:  868100000,
+			Modulation: common.Modulation_LORA,
+			ModulationInfo: &gw.UplinkTXInfo_LoraModulationInfo{
+				LoraModulationInfo: &gw.LoRaModulationInfo{
+					SpreadingFactor:       9,
+					Bandwidth:             125,
+					CodeRate:              "4/5",
+					PolarizationInversion: true,
+				},
+			},
+		},
+		RxInfo: []*gw.UplinkRXInfo{
+			{
+				GatewayId: []byte{1, 2, 3, 4, 5, 6, 7, 8},
+				CrcStatus: gw.CRCStatus_CRC_OK,
+			},
+		},
+	}, &asReq))
+}
+
+func (ts *PassiveRoamingSNSTestSuite) TestPRStartReqStatefull() {
+	assert := require.New(ts.T())
+
+	// setup stateless roaming-agreement
+	conf := test.GetConfig()
+	conf.Roaming.Servers = []config.RoamingServer{
+		{
+			NetID:                  lorawan.NetID{6, 6, 6},
+			CheckMIC:               true,
+			Async:                  false,
+			PassiveRoaming:         true,
+			PassiveRoamingLifetime: time.Minute,
+			Server:                 ts.fnsServer.URL,
+		},
+	}
+	assert.NoError(roaming.Setup(conf))
+
+	devAddr := lorawan.DevAddr{1, 2, 3, 4}
+	devAddr.SetAddrPrefix(conf.NetworkServer.NetID)
+
+	// setup device-session
+	ts.CreateDeviceSession(storage.DeviceSession{
+		JoinEUI:               lorawan.EUI64{8, 7, 6, 5, 4, 3, 2, 1},
+		DevAddr:               devAddr,
+		FNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		NwkSEncKey:            [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		FCntUp:                20,
+		NFCntDown:             10,
+		EnabledUplinkChannels: []int{0, 1, 2},
+		RX2Frequency:          869525000,
+	})
+
+	fPort := uint8(10)
+
+	phy := lorawan.PHYPayload{
+		MHDR: lorawan.MHDR{
+			MType: lorawan.UnconfirmedDataUp,
+			Major: lorawan.LoRaWANR1,
+		},
+		MACPayload: &lorawan.MACPayload{
+			FHDR: lorawan.FHDR{
+				DevAddr: devAddr,
+				FCnt:    20,
+			},
+			FPort: &fPort,
+		},
+	}
+	assert.NoError(phy.SetUplinkDataMIC(lorawan.LoRaWAN1_0, 0, 0, 0, ts.DeviceSession.FNwkSIntKey, ts.DeviceSession.SNwkSIntKey))
+	phyB, err := phy.MarshalBinary()
+	assert.NoError(err)
+
+	// setup client
+	client, err := backend.NewClient(backend.ClientConfig{
+		SenderID:   "060606",
+		ReceiverID: conf.NetworkServer.NetID.String(),
+		Server:     ts.hnsServer.URL,
+	})
+	assert.NoError(err)
+
+	// request
+	ulFreq := 868.1
+	dataRate := 3
+	recvTime := time.Now().Round(time.Second)
+	gwCnt := 1
+
+	prStartReq := backend.PRStartReqPayload{
+		PHYPayload: backend.HEXBytes(phyB),
+		ULMetaData: backend.ULMetaData{
+			ULFreq:   &ulFreq,
+			DataRate: &dataRate,
+			RecvTime: backend.ISO8601Time(recvTime),
+			RFRegion: "EU868",
+			GWCnt:    &gwCnt,
+			GWInfo: []backend.GWInfoElement{
+				{
+					ID:        backend.HEXBytes{1, 2, 3, 4, 5, 6, 7, 8},
+					DLAllowed: true,
+				},
+			},
+		},
+	}
+	resp, err := client.PRStartReq(context.Background(), prStartReq)
+	assert.NoError(err)
+	assert.Equal(backend.Success, resp.Result.ResultCode)
+	assert.Equal(60, *resp.Lifetime)
+
+	// nothing sent as in case of statefull an XmitDataReq is expected
+	// after the PRStartReq.
+	assert.Equal(0, len(ts.ASClient.HandleDataUpChan))
 }
 
 func (ts *PassiveRoamingSNSTestSuite) TestXmitDataReqUplinkNoDownlink() {
+	assert := require.New(ts.T())
 
+	// setup stateless roaming-agreement
+	conf := test.GetConfig()
+	conf.Roaming.Servers = []config.RoamingServer{
+		{
+			NetID:                  lorawan.NetID{6, 6, 6},
+			CheckMIC:               true,
+			Async:                  false,
+			PassiveRoaming:         true,
+			PassiveRoamingLifetime: time.Minute,
+			Server:                 ts.fnsServer.URL,
+		},
+	}
+	assert.NoError(roaming.Setup(conf))
+
+	devAddr := lorawan.DevAddr{1, 2, 3, 4}
+	devAddr.SetAddrPrefix(conf.NetworkServer.NetID)
+
+	// setup device-session
+	ts.CreateDeviceSession(storage.DeviceSession{
+		JoinEUI:               lorawan.EUI64{8, 7, 6, 5, 4, 3, 2, 1},
+		DevAddr:               devAddr,
+		FNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		NwkSEncKey:            [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		FCntUp:                20,
+		NFCntDown:             10,
+		EnabledUplinkChannels: []int{0, 1, 2},
+		RX2Frequency:          869525000,
+	})
+
+	fPort := uint8(10)
+
+	phy := lorawan.PHYPayload{
+		MHDR: lorawan.MHDR{
+			MType: lorawan.UnconfirmedDataUp,
+			Major: lorawan.LoRaWANR1,
+		},
+		MACPayload: &lorawan.MACPayload{
+			FHDR: lorawan.FHDR{
+				DevAddr: devAddr,
+				FCnt:    20,
+			},
+			FPort: &fPort,
+		},
+	}
+	assert.NoError(phy.SetUplinkDataMIC(lorawan.LoRaWAN1_0, 0, 0, 0, ts.DeviceSession.FNwkSIntKey, ts.DeviceSession.SNwkSIntKey))
+	phyB, err := phy.MarshalBinary()
+	assert.NoError(err)
+
+	// setup client
+	client, err := backend.NewClient(backend.ClientConfig{
+		SenderID:   "060606",
+		ReceiverID: conf.NetworkServer.NetID.String(),
+		Server:     ts.hnsServer.URL,
+	})
+	assert.NoError(err)
+
+	// request
+	ulFreq := 868.1
+	dataRate := 3
+	recvTime := time.Now().Round(time.Second)
+	gwCnt := 1
+
+	xmitDataReq := backend.XmitDataReqPayload{
+		PHYPayload: backend.HEXBytes(phyB),
+		ULMetaData: &backend.ULMetaData{
+			ULFreq:   &ulFreq,
+			DataRate: &dataRate,
+			RecvTime: backend.ISO8601Time(recvTime),
+			RFRegion: "EU868",
+			GWCnt:    &gwCnt,
+			GWInfo: []backend.GWInfoElement{
+				{
+					ID:        backend.HEXBytes{1, 2, 3, 4, 5, 6, 7, 8},
+					DLAllowed: true,
+				},
+			},
+		},
+	}
+	resp, err := client.XmitDataReq(context.Background(), xmitDataReq)
+	assert.NoError(err)
+	assert.Equal(backend.Success, resp.Result.ResultCode)
+
+	// check downlink was sent to AS
+	asReq := <-ts.ASClient.HandleDataUpChan
+	assert.True(proto.Equal(&as.HandleUplinkDataRequest{
+		DevEui:  ts.Device.DevEUI[:],
+		JoinEui: ts.DeviceSession.JoinEUI[:],
+		FCnt:    20,
+		FPort:   10,
+		Dr:      3,
+		TxInfo: &gw.UplinkTXInfo{
+			Frequency:  868100000,
+			Modulation: common.Modulation_LORA,
+			ModulationInfo: &gw.UplinkTXInfo_LoraModulationInfo{
+				LoraModulationInfo: &gw.LoRaModulationInfo{
+					SpreadingFactor:       9,
+					Bandwidth:             125,
+					CodeRate:              "4/5",
+					PolarizationInversion: true,
+				},
+			},
+		},
+		RxInfo: []*gw.UplinkRXInfo{
+			{
+				GatewayId: []byte{1, 2, 3, 4, 5, 6, 7, 8},
+				CrcStatus: gw.CRCStatus_CRC_OK,
+			},
+		},
+	}, &asReq))
+
+	// assert that no request was sent to the fNS
+	assert.Len(ts.fnsRequest, 0)
 }
 
 func (ts *PassiveRoamingSNSTestSuite) TestXmitDataReqUplinkDownlink() {
+	assert := require.New(ts.T())
 
+	// setup stateless roaming-agreement
+	conf := test.GetConfig()
+	conf.Roaming.Servers = []config.RoamingServer{
+		{
+			NetID:                  lorawan.NetID{6, 6, 6},
+			CheckMIC:               true,
+			Async:                  false,
+			PassiveRoaming:         true,
+			PassiveRoamingLifetime: time.Minute,
+			Server:                 ts.fnsServer.URL,
+		},
+	}
+	assert.NoError(roaming.Setup(conf))
+
+	devAddr := lorawan.DevAddr{1, 2, 3, 4}
+	devAddr.SetAddrPrefix(conf.NetworkServer.NetID)
+
+	// setup device-session
+	ts.CreateDeviceSession(storage.DeviceSession{
+		JoinEUI:               lorawan.EUI64{8, 7, 6, 5, 4, 3, 2, 1},
+		DevAddr:               devAddr,
+		FNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		NwkSEncKey:            [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		FCntUp:                20,
+		NFCntDown:             10,
+		EnabledUplinkChannels: []int{0, 1, 2},
+		RX2Frequency:          869525000,
+	})
+
+	fPort := uint8(10)
+
+	phy := lorawan.PHYPayload{
+		MHDR: lorawan.MHDR{
+			MType: lorawan.ConfirmedDataUp, // confirmed triggers a downlink
+			Major: lorawan.LoRaWANR1,
+		},
+		MACPayload: &lorawan.MACPayload{
+			FHDR: lorawan.FHDR{
+				DevAddr: devAddr,
+				FCnt:    20,
+			},
+			FPort: &fPort,
+		},
+	}
+	assert.NoError(phy.SetUplinkDataMIC(lorawan.LoRaWAN1_0, 0, 0, 0, ts.DeviceSession.FNwkSIntKey, ts.DeviceSession.SNwkSIntKey))
+	phyB, err := phy.MarshalBinary()
+	assert.NoError(err)
+
+	// setup client
+	client, err := backend.NewClient(backend.ClientConfig{
+		SenderID:   "060606",
+		ReceiverID: conf.NetworkServer.NetID.String(),
+		Server:     ts.hnsServer.URL,
+	})
+	assert.NoError(err)
+
+	// mock XmitDataAns from fNS (for downlink)
+	xmitDataAns := backend.XmitDataAnsPayload{
+		BasePayloadResult: backend.BasePayloadResult{
+			Result: backend.Result{
+				ResultCode: backend.Success,
+			},
+		},
+	}
+	xmitDataAnsB, err := json.Marshal(xmitDataAns)
+	assert.NoError(err)
+	ts.fnsResponse = append(ts.fnsResponse, xmitDataAnsB)
+
+	// request
+	ulFreq := 868.1
+	dataRate := 3
+	recvTime := time.Now().Round(time.Second)
+	gwCnt := 1
+
+	xmitDataReq := backend.XmitDataReqPayload{
+		PHYPayload: backend.HEXBytes(phyB),
+		ULMetaData: &backend.ULMetaData{
+			ULFreq:   &ulFreq,
+			DataRate: &dataRate,
+			RecvTime: backend.ISO8601Time(recvTime),
+			RFRegion: "EU868",
+			GWCnt:    &gwCnt,
+			GWInfo: []backend.GWInfoElement{
+				{
+					ID:        backend.HEXBytes{1, 2, 3, 4, 5, 6, 7, 8},
+					ULToken:   backend.HEXBytes{3, 2, 1},
+					DLAllowed: true,
+				},
+			},
+		},
+	}
+	resp, err := client.XmitDataReq(context.Background(), xmitDataReq)
+	assert.NoError(err)
+	assert.Equal(backend.Success, resp.Result.ResultCode)
+
+	// check downlink was sent to AS
+	asReq := <-ts.ASClient.HandleDataUpChan
+	assert.True(proto.Equal(&as.HandleUplinkDataRequest{
+		DevEui:          ts.Device.DevEUI[:],
+		JoinEui:         ts.DeviceSession.JoinEUI[:],
+		FCnt:            20,
+		FPort:           10,
+		Dr:              3,
+		ConfirmedUplink: true,
+		TxInfo: &gw.UplinkTXInfo{
+			Frequency:  868100000,
+			Modulation: common.Modulation_LORA,
+			ModulationInfo: &gw.UplinkTXInfo_LoraModulationInfo{
+				LoraModulationInfo: &gw.LoRaModulationInfo{
+					SpreadingFactor:       9,
+					Bandwidth:             125,
+					CodeRate:              "4/5",
+					PolarizationInversion: true,
+				},
+			},
+		},
+		RxInfo: []*gw.UplinkRXInfo{
+			{
+				GatewayId: []byte{1, 2, 3, 4, 5, 6, 7, 8},
+				CrcStatus: gw.CRCStatus_CRC_OK,
+				Context:   []byte{3, 2, 1},
+			},
+		},
+	}, &asReq))
+
+	phy = lorawan.PHYPayload{
+		MHDR: lorawan.MHDR{
+			MType: lorawan.UnconfirmedDataDown,
+			Major: lorawan.LoRaWANR1,
+		},
+		MACPayload: &lorawan.MACPayload{
+			FHDR: lorawan.FHDR{
+				DevAddr: devAddr,
+				FCnt:    10,
+				FCtrl: lorawan.FCtrl{
+					ADR: true,
+					ACK: true,
+				},
+			},
+		},
+	}
+	assert.NoError(phy.SetDownlinkDataMIC(lorawan.LoRaWAN1_0, 0, ts.DeviceSession.SNwkSIntKey))
+	phyB, err = phy.MarshalBinary()
+	assert.NoError(err)
+
+	// assert downlink XmitDataReq
+	assert.Len(ts.fnsRequest, 1)
+	var fNSReq backend.XmitDataReqPayload
+	assert.NoError(json.Unmarshal(ts.fnsRequest[0], &fNSReq))
+	assert.NotEqual(0, fNSReq.TransactionID)
+	fNSReq.TransactionID = 0
+
+	dlFreq1 := 868.1
+	dlFreq2 := 869.525
+	rxDelay1 := 0
+	classMode := "A"
+	dataRate1 := 3
+	dataRate2 := 0
+
+	assert.Equal(backend.XmitDataReqPayload{
+		BasePayload: backend.BasePayload{
+			ProtocolVersion: "1.0",
+			SenderID:        "030201",
+			ReceiverID:      "060606",
+			MessageType:     backend.XmitDataReq,
+		},
+		PHYPayload: backend.HEXBytes(phyB),
+		DLMetaData: &backend.DLMetaData{
+			DevEUI:    &ts.Device.DevEUI,
+			DLFreq1:   &dlFreq1,
+			DLFreq2:   &dlFreq2,
+			RXDelay1:  &rxDelay1,
+			ClassMode: &classMode,
+			DataRate1: &dataRate1,
+			DataRate2: &dataRate2,
+			GWInfo: []backend.GWInfoElement{
+				{
+					ULToken: backend.HEXBytes{3, 2, 1},
+				},
+			},
+		},
+	}, fNSReq)
 }
 
 // TestPassiveRoamingFNS tests the passive-roaming from the fNS POV.
