@@ -60,6 +60,7 @@ type Gateway struct {
 	Location         GPSPoint       `db:"location"`
 	Altitude         float64        `db:"altitude"`
 	TLSCert          []byte         `db:"tls_cert"`
+	JWT              uuid.UUID      `db:"jwt_id"`
 	Boards           []GatewayBoard `db:"-"`
 }
 
@@ -100,8 +101,9 @@ func CreateGateway(ctx context.Context, db sqlx.Execer, gw *Gateway) error {
 			gateway_profile_id,
 			routing_profile_id,
 			tls_cert,
+			jwt_id,
 			service_profile_id
-		) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		gw.GatewayID[:],
 		gw.CreatedAt,
 		gw.UpdatedAt,
@@ -112,6 +114,7 @@ func CreateGateway(ctx context.Context, db sqlx.Execer, gw *Gateway) error {
 		gw.GatewayProfileID,
 		gw.RoutingProfileID,
 		gw.TLSCert,
+		gw.JWT,
 		gw.ServiceProfileID,
 	)
 	if err != nil {
@@ -302,7 +305,8 @@ func UpdateGateway(ctx context.Context, db sqlx.Execer, gw *Gateway) error {
 			gateway_profile_id = $7,
 			routing_profile_id = $8,
 			tls_cert = $9,
-			service_profile_id = $10
+			jwt_id = $10,
+			service_profile_id = $11
 		where gateway_id = $1`,
 		gw.GatewayID[:],
 		gw.UpdatedAt,
@@ -313,6 +317,7 @@ func UpdateGateway(ctx context.Context, db sqlx.Execer, gw *Gateway) error {
 		gw.GatewayProfileID,
 		gw.RoutingProfileID,
 		gw.TLSCert,
+		gw.JWT,
 		gw.ServiceProfileID,
 	)
 	if err != nil {

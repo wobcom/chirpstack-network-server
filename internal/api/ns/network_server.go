@@ -7,6 +7,7 @@ import (
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/jmoiron/sqlx"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -1073,6 +1074,40 @@ func (c *NetworkServerAPI) GenerateGatewayClientCertificate(ctx context.Context,
 		CaCert:    ca,
 		ExpiresAt: expiresAtPB,
 	}, nil
+}
+
+// GenerateGatewayClientJWT returns a JSON Web Token for gateway authentication / authorization.
+func (c *NetworkServerAPI) GenerateGatewayClientJWT(ctx context.Context, req *ns.GenerateGatewayClientJWTRequest) (*ns.GenerateGatewayClientJWTResponse, error) {
+	var id lorawan.EUI64
+	var resp ns.GenerateGatewayClientJWTResponse
+	copy(id[:], req.Id)
+	err := storage.Transaction(func(tx sqlx.Ext) error {
+		gw, err := storage.GetGateway(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+
+		jwt_id, err := uuid.NewV4()
+		if err != nil {
+			return errors.Wrap(err, "new uuid error")
+		}
+
+		jwToken, err := gateway.GenerateClientJWT(id, jwt_id)
+		if err != nil {
+			return err
+		}
+
+		gw.JWT = jwt_id
+		resp = ns.GenerateGatewayClientJWTResponse{
+			Id:       jwt_id.String(),
+			JwtToken: jwToken,
+		}
+		return storage.UpdateGateway(ctx, tx, &gw)
+	})
+	if err != nil {
+		return nil, errToRPCError(err)
+	}
+	return &resp, nil
 }
 
 // GetGatewayStats returns stats of an existing gateway.
